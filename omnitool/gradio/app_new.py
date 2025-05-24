@@ -28,6 +28,8 @@ from tools import ToolResult
 import requests
 from requests.exceptions import RequestException
 import base64
+import random
+import openai
 
 CONFIG_DIR = Path("~/.anthropic").expanduser()
 API_KEY_FILE = CONFIG_DIR / "api_key"
@@ -291,6 +293,15 @@ def process_input(user_input, state):
     file_choices_update = detect_new_files(state)
     yield state['chatbot_messages'], file_choices_update
 
+    # --- After model outputs, run evaluation ---
+    # Example: collect all model outputs and evaluate
+    # This is a placeholder for where you would call the evaluator after model responses
+    # model_outputs = [{"model": state["model"], "output": <model_output>}]
+    # evaluator_model = state.get("evaluator", "gpt-4o-eval")
+    # evaluation_results = evaluate_model_outputs(model_outputs, evaluator_model)
+    # print("Evaluation Results:", evaluation_results)
+    # You can display these results in the UI as needed
+
 def stop_app(state):
     state["stop"] = True
     return "App stopped"
@@ -447,14 +458,14 @@ def handle_file_upload(files, state):
             state['uploaded_files'].append(file_path_str)
     
     # Update the view file dropdown with all uploaded files
-    all_file_choices = [(Path(path).name, path) for path in state['uploaded_files']]
+    all_file_choices = [(str(Path(path).name), str(path)) for path in state['uploaded_files']]
     
     return gr.update(choices=all_file_choices)
 
 def toggle_view(view_mode, file_path=None, state=None):
     """Toggle between OmniTool Computer view and file viewer"""
     # If switching to File Viewer mode, detect and add new files to the state
-    file_choices_update = gr.update()
+    file_choices_update = gr.update(choices=[])
     if view_mode == "File Viewer" and state is not None:
         file_choices_update = detect_new_files(state)
     
@@ -494,6 +505,42 @@ def auto_refresh_files(state):
     """Automatically refresh the list of files from the current session and detect new files"""
     return detect_new_files(state)
 
+def update_only_n_images(new_value, state):
+    state["only_n_most_recent_images"] = new_value
+    return
+
+def update_provider(new_provider, state):
+    state["provider"] = new_provider
+    # Optionally, update the API key field if needed
+    return state.get("api_key", "")
+
+def update_api_key(new_api_key, state):
+    state["api_key"] = new_api_key
+    return
+
+def clear_chat(state):
+    state["chatbot_messages"] = []
+    return []
+
+def view_file(file_path, view_toggle):
+    # This function returns the HTML for the file viewer
+    return get_file_viewer_html(file_path)
+
+def render_model_cards(evals):
+    # Render a card deck for model outputs and evaluations
+    html = '<div class="card-deck">'
+    for eval in evals:
+        html += f'''
+        <div class="model-card">
+            <h4>{eval['model']}</h4>
+            <div class="output"><b>Output:</b> {eval['output']}</div>
+            <div class="evaluation"><b>Evaluation:</b> {eval['evaluation']}</div>
+            <div class="score">Score: {eval['score']}</div>
+        </div>
+        '''
+    html += '</div>'
+    return html
+
 with gr.Blocks(theme=gr.themes.Default()) as demo:
     gr.HTML("""
         <style>
@@ -504,7 +551,55 @@ with gr.Blocks(theme=gr.themes.Default()) as demo:
             padding: 0 !important;
         }
         .markdown-text p {
-            font-size: 18px;  /* Adjust the font size as needed */
+            font-size: 18px;
+        }
+        /* Card deck styles */
+        .card-deck {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 24px;
+            justify-content: center;
+            margin-top: 24px;
+        }
+        .model-card {
+            background: linear-gradient(135deg, #e3f0ff 0%, #f8fbff 100%);
+            border-radius: 18px;
+            box-shadow: 0 4px 16px rgba(30, 64, 175, 0.10), 0 1.5px 4px rgba(30, 64, 175, 0.08);
+            padding: 24px 20px 18px 20px;
+            min-width: 320px;
+            max-width: 370px;
+            flex: 1 1 320px;
+            transition: box-shadow 0.2s;
+            border: 1.5px solid #b6d0f7;
+        }
+        .model-card:hover {
+            box-shadow: 0 8px 32px rgba(30, 64, 175, 0.18), 0 2px 8px rgba(30, 64, 175, 0.12);
+        }
+        .model-card h4 {
+            margin-top: 0;
+            margin-bottom: 8px;
+            color: #1e40af;
+            font-weight: 700;
+            font-size: 1.15rem;
+        }
+        .model-card .output {
+            font-size: 1.05rem;
+            margin-bottom: 10px;
+            color: #222b3a;
+        }
+        .model-card .evaluation {
+            font-size: 0.98rem;
+            color: #3b4a6b;
+            margin-bottom: 6px;
+        }
+        .model-card .score {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: #2563eb;
+            background: #e0eaff;
+            border-radius: 8px;
+            padding: 2px 10px;
+            display: inline-block;
         }
         </style>
     """)
@@ -525,12 +620,22 @@ with gr.Blocks(theme=gr.themes.Default()) as demo:
     with gr.Accordion("Settings", open=True, elem_classes="accordion-header"): 
         with gr.Row():
             with gr.Column():
-                model = gr.Dropdown(
-                    label="Model",
-                    choices=["omniparser + gpt-4o", "omniparser + o1", "omniparser + o3-mini", "omniparser + R1", "omniparser + qwen2.5vl", "claude-3-5-sonnet-20241022", "omniparser + gpt-4o-orchestrated", "omniparser + o1-orchestrated", "omniparser + o3-mini-orchestrated", "omniparser + R1-orchestrated", "omniparser + qwen2.5vl-orchestrated"],
-                    value="omniparser + gpt-4o-orchestrated",
-                    interactive=True,
-                    container=True
+                # Multi-model selection (CheckboxGroup)
+                model_options = [
+                    "omniparser + gpt-4o", "omniparser + o1", "omniparser + o3-mini", "omniparser + R1", "omniparser + qwen2.5vl", "claude-3-5-sonnet-20241022", "omniparser + gpt-4o-orchestrated", "omniparser + o1-orchestrated", "omniparser + o3-mini-orchestrated", "omniparser + R1-orchestrated", "omniparser + qwen2.5vl-orchestrated"
+                ]
+                selected_models = gr.CheckboxGroup(
+                    model_options,
+                    label="Select Models",
+                    value=[model_options[0]],
+                    interactive=True
+                )
+            with gr.Column():
+                evaluator = gr.Dropdown(
+                    label="Evaluator Model",
+                    choices=["gpt-4o-eval", "claude-3-opus-eval", "llama-3-70b-eval"],
+                    value="gpt-4o-eval",
+                    interactive=True
                 )
             with gr.Column():
                 only_n_images = gr.Slider(
@@ -546,9 +651,7 @@ with gr.Blocks(theme=gr.themes.Default()) as demo:
                 provider = gr.Dropdown(
                     label="API Provider",
                     choices=[option.value for option in APIProvider],
-                    value="openai",
-                    interactive=False,
-                    container=True
+                    value="openai"
                 )
             with gr.Column(2):
                 api_key = gr.Textbox(
@@ -556,8 +659,7 @@ with gr.Blocks(theme=gr.themes.Default()) as demo:
                     type="password",
                     value=state.value.get("api_key", ""),
                     placeholder="Paste your API key here",
-                    interactive=True,
-                    container=True
+                    interactive=True
                 )
 
     # File Upload Section
@@ -580,8 +682,7 @@ with gr.Blocks(theme=gr.themes.Default()) as demo:
             view_file_dropdown = gr.Dropdown(
                 label="View File",
                 choices=[],
-                interactive=True,
-                container=True
+                interactive=True
             )
             view_toggle = gr.Radio(
                 label="Display Mode",
@@ -594,11 +695,11 @@ with gr.Blocks(theme=gr.themes.Default()) as demo:
         with gr.Column(scale=8):
             chat_input = gr.Textbox(
                 show_label=False, 
-                placeholder="Type a message to send to Omniparser + X ...", 
-                container=False
+                placeholder="Type a message to send to Omniparser + X ..."
             )
+            submit_button = gr.Button(value="Submit", variant="primary")
         with gr.Column(scale=1, min_width=50):
-            submit_button = gr.Button(value="Send", variant="primary", elem_classes="primary-button")
+            run_eval_button = gr.Button(value="Run Multi-Model Evaluation", variant="primary", elem_classes="primary-button")
         with gr.Column(scale=1, min_width=50):
             stop_button = gr.Button(value="Stop", variant="secondary", elem_classes="secondary-button")
 
@@ -615,92 +716,60 @@ with gr.Blocks(theme=gr.themes.Default()) as demo:
                 get_file_viewer_html(),
                 elem_classes="no-padding"
             )
+            # Add card deck output for multi-model results
+            card_deck_output = gr.HTML()
 
-    def update_model(model_selection, state):
-        state["model"] = model_selection
-        print(f"Model updated to: {state['model']}")
-        
-        if model_selection == "claude-3-5-sonnet-20241022":
-            provider_choices = [option.value for option in APIProvider if option.value != "openai"]
-        elif model_selection in set(["omniparser + gpt-4o", "omniparser + o1", "omniparser + o3-mini", "omniparser + gpt-4o-orchestrated", "omniparser + o1-orchestrated", "omniparser + o3-mini-orchestrated"]):
-            provider_choices = ["openai"]
-        elif model_selection == "omniparser + R1":
-            provider_choices = ["groq"]
-        elif model_selection == "omniparser + qwen2.5vl":
-            provider_choices = ["dashscope"]
-        else:
-            provider_choices = [option.value for option in APIProvider]
-        default_provider_value = provider_choices[0]
+    # --- Multi-model + OmniParser agent logic ---
+    def run_multi_model_eval(user_input, selected_models, evaluator, state):
+        from functools import partial
+        model_outputs = []
+        for model_name in selected_models:
+            # Setup state for each model
+            temp_state = state.copy() if isinstance(state, dict) else dict(state)
+            temp_state["model"] = model_name
+            temp_state["messages"] = [{
+                "role": Sender.USER,
+                "content": [TextBlock(type="text", text=user_input)],
+            }]
+            temp_state['chatbot_messages'] = []
+            # Run the agent for this model (single step, get output)
+            output_text = None
+            for loop_msg in sampling_loop_sync(
+                model=model_name,
+                provider=temp_state.get("provider", "openai"),
+                messages=temp_state["messages"],
+                output_callback=partial(chatbot_output_callback, chatbot_state=temp_state['chatbot_messages'], hide_images=True),
+                tool_output_callback=partial(_tool_output_callback, tool_state=temp_state["tools"]),
+                api_response_callback=partial(_api_response_callback, response_state=temp_state["responses"]),
+                api_key=temp_state.get("api_key", os.environ.get("OPENAI_API_KEY", "")),
+                only_n_most_recent_images=temp_state.get("only_n_most_recent_images", 2),
+                max_tokens=2048,
+                omniparser_url=args.omniparser_server_url,
+                save_folder=str(RUN_FOLDER)
+            ):
+                # Only take the last output
+                pass
+            # Get the last assistant message as output
+            for user_msg, bot_msg in temp_state['chatbot_messages'][::-1]:
+                if bot_msg:
+                    output_text = bot_msg
+                    break
+            if not output_text:
+                output_text = "[No output]"
+            model_outputs.append({
+                "model": model_name,
+                "output": output_text
+            })
+        # Evaluate all outputs
+        evals = evaluate_model_outputs(model_outputs, evaluator)
+        return render_model_cards(evals)
 
-        provider_interactive = len(provider_choices) > 1
-        api_key_placeholder = f"{default_provider_value.title()} API Key"
-
-        # Update state
-        state["provider"] = default_provider_value
-        state["api_key"] = state.get(f"{default_provider_value}_api_key", "")
-
-        # Calls to update other components UI
-        provider_update = gr.update(
-            choices=provider_choices,
-            value=default_provider_value,
-            interactive=provider_interactive
-        )
-        api_key_update = gr.update(
-            placeholder=api_key_placeholder,
-            value=state["api_key"]
-        )
-
-        return provider_update, api_key_update
-
-    def update_only_n_images(only_n_images_value, state):
-        state["only_n_most_recent_images"] = only_n_images_value
-   
-    def update_provider(provider_value, state):
-        # Update state
-        state["provider"] = provider_value
-        state["api_key"] = state.get(f"{provider_value}_api_key", "")
-        
-        # Calls to update other components UI
-        api_key_update = gr.update(
-            placeholder=f"{provider_value.title()} API Key",
-            value=state["api_key"]
-        )
-        return api_key_update
-                
-    def update_api_key(api_key_value, state):
-        state["api_key"] = api_key_value
-        state[f'{state["provider"]}_api_key'] = api_key_value
-
-    def clear_chat(state):
-        # Reset message-related state
-        state["messages"] = []
-        state["responses"] = {}
-        state["tools"] = {}
-        state['chatbot_messages'] = []
-        return state['chatbot_messages']
-
-    def view_file(file_path, view_mode):
-        """Generate HTML to view the selected file if in File Viewer mode"""
-        if view_mode == "File Viewer" and file_path:
-            return get_file_viewer_html(file_path)
-        elif view_mode == "OmniTool Computer":
-            return get_file_viewer_html()  # Return VNC viewer
-        else:
-            return display_area.value  # Keep current display
-
-    def update_view_file_dropdown(uploaded_files):
-        """Update the view file dropdown when uploaded files change"""
-        if not uploaded_files:
-            return gr.update(choices=[])
-        
-        file_choices = [(Path(path).name, path) for path in uploaded_files]
-        return gr.update(choices=file_choices)
-
-    def reset_view():
-        """Reset the view to the VNC viewer"""
-        return get_file_viewer_html()
-
-    model.change(fn=update_model, inputs=[model, state], outputs=[provider, api_key])
+    run_eval_button.click(
+        run_multi_model_eval,
+        [chat_input, selected_models, evaluator, state],
+        card_deck_output
+    )
+    
     only_n_images.change(fn=update_only_n_images, inputs=[only_n_images, state], outputs=None)
     provider.change(fn=update_provider, inputs=[provider, state], outputs=api_key)
     api_key.change(fn=update_api_key, inputs=[api_key, state], outputs=None)
@@ -756,5 +825,61 @@ with gr.Blocks(theme=gr.themes.Default()) as demo:
     # Add the JavaScript to the page
     gr.HTML("<script>(" + js_refresh + ")();</script>")
     
+# --- Evaluation logic stub ---
+def evaluate_model_outputs(model_outputs, evaluator_model):
+    """
+    Given a list of model outputs and an evaluator model name, return a list of dicts:
+    [{
+        'model': <model_name>,
+        'output': <model_output>,
+        'evaluation': <short written evaluation>,
+        'score': <numerical score>
+    }, ...]
+    """
+    import re
+    import json
+    results = []
+    openai_api_key = os.environ.get("OPENAI_API_KEY")
+    if not openai_api_key:
+        raise RuntimeError("OPENAI_API_KEY environment variable not set.")
+    for mo in model_outputs:
+        prompt = f"""
+You are an expert model evaluator. Given the following model output, provide a short written evaluation (1-2 sentences) and a numerical score from 0 to 10 (10 = perfect, 0 = totally wrong).\n\nModel Output:\n{mo['output']}\n\nRespond in JSON with keys 'evaluation' and 'score'.
+"""
+        try:
+            # For OpenAI Python SDK >=1.x
+            response = openai.chat.completions.create(
+                model=evaluator_model,
+                messages=[
+                    {"role": "system", "content": "You are a helpful and strict model evaluator."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=128,
+                temperature=0.2,
+                api_key=openai_api_key
+            )
+            content = response.choices[0].message.content
+            # Try to extract JSON from the response
+            match = re.search(r'\{.*\}', content, re.DOTALL)
+            if match:
+                parsed = json.loads(match.group(0))
+            else:
+                # Fallback: try to parse as JSON directly
+                parsed = json.loads(content)
+            evaluation = parsed.get("evaluation", "No evaluation returned.")
+            score = parsed.get("score", 0)
+        except Exception as e:
+            evaluation = f"[Error from evaluator: {e}]"
+            score = 0
+        results.append({
+            'model': mo['model'],
+            'output': mo['output'],
+            'evaluation': evaluation,
+            'score': score
+        })
+    return results
+# --- End evaluation logic stub ---
+
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7888)
+    port = 7860  # Always use the same port
+    demo.launch(server_name="0.0.0.0", server_port=port, share=True)
